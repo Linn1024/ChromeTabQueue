@@ -1,0 +1,34 @@
+{
+  "manifest_version": 2,
+  "name": "Tab Queue",
+  "version": "1.0",
+  "description": "Queue tab switch",
+  "icons": { "16" : "icon.png",
+                        "48" : "icon.png",
+                        "128" : "icon.png"},
+  "browser_action": {
+    "default_icon": "icon.png"
+  },
+  "permissions": [
+          "webNavigation",
+          "tabs"
+        ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "commands": {
+    "switch": {
+       "suggested_key": {
+         "default": "Shift+Alt+D"
+      },
+       "description": "Switch between tabs"
+    },
+    "showQueue": {
+       "suggested_key": {
+         "default": "Shift+Alt+Q"
+      },
+       "description": "Shows queue of tabs"
+    }
+
+  }
+}
