@@ -17,11 +17,17 @@
     "scripts": ["background.js"]
   },
   "commands": {
-    "switch": {
+    "switchBack": {
        "suggested_key": {
          "default": "Shift+Alt+D"
       },
        "description": "Switch between tabs"
+    },
+    "switchForward": {
+       "suggested_key": {
+         "default": "Shift+Alt+F"
+      },
+       "description": "Switch between tabs (remove error)"
     },
     "showQueue": {
        "suggested_key": {

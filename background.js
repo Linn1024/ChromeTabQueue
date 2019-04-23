@@ -6,13 +6,17 @@ var wi;
 var switching = 0;
 
 chrome.commands.onCommand.addListener(function(command) {
-	if (command == "switch"){
+	if (command == "switchBack" || command == "switchForward"){
+		if (command == "switchBack")
+			p = -1
+		else
+			p = 1
 		clearTimeout(to);
 		switching = 1;
 		activeTabId();
-		num = ((num - 1 + queueTabs.length) % queueTabs.length);
+		num = ((num + p + queueTabs.length) % queueTabs.length);
 		if (ti == queueTabs[num])
-			num = ((num - 1 + queueTabs.length) % queueTabs.length);
+			num = ((num + p + queueTabs.length) % queueTabs.length);
 		chrome.tabs.update(queueTabs[num], {active: true});
 		to = setTimeout(changeActiveTab, 1000);
 	}
@@ -50,4 +54,4 @@ chrome.tabs.onActivated.addListener(function (ai){
 	if (switching != 1){
 		changeActiveTab();
 }
-})
+})               	
