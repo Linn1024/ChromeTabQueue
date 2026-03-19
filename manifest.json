@@ -1,40 +1,57 @@
 {
-  "manifest_version": 2,
+  "manifest_version": 3,
   "name": "Tab Queue",
   "version": "1.0",
   "description": "Queue tab switch",
-  "icons": { "16" : "icon.png",
-                        "48" : "icon.png",
-                        "128" : "icon.png"},
-  "browser_action": {
+  "icons": {
+    "16": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  },
+  "action": {
     "default_icon": "icon.png"
   },
   "permissions": [
-          "webNavigation",
-          "tabs"
-        ],
+    "tabs",
+    "storage",
+    "scripting",
+    "notifications"
+  ], 
+ "host_permissions": [
+    "<all_urls>"
+  ],
   "background": {
-    "scripts": ["background.js"]
+    "service_worker": "background.js"
   },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "modifiers.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
   "commands": {
     "switchBack": {
-       "suggested_key": {
-         "default": "Shift+Alt+D"
+      "suggested_key": {
+        "default": "Shift+Alt+D"
       },
-       "description": "Switch between tabs"
+      "description": "Switch between tabs"
     },
     "switchForward": {
-       "suggested_key": {
-         "default": "Shift+Alt+F"
+      "suggested_key": {
+        "default": "Shift+Alt+F"
       },
-       "description": "Switch between tabs (remove error)"
+      "description": "Switch between tabs (remove error)"
     },
     "showQueue": {
-       "suggested_key": {
-         "default": "Shift+Alt+Q"
+      "suggested_key": {
+        "default": "Shift+Alt+Q"
       },
-       "description": "Shows queue of tabs"
+      "description": "Shows queue of tabs"
     }
-
   }
 }
