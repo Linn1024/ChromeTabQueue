@@ -1,32 +1,143 @@
-﻿// background.js — Refactored: clearer structure, single-responsibility modules, safer state
-
 /** @typedef {number} TabId */
 /** @typedef {number} WindowId */
 
-/* ======================
- * Constants & Utilities
- * ====================== */
+const STORAGE_KEY = "queuesByWindow";
+const SAME_HOLD_COMMAND_GAP_MS = 700;
 
-const STORAGE_KEYS = { QUEUES_BY_WINDOW: "queuesByWindow" };
-// Safe modulo (handles negatives & empty arrays)
-const safeMod = (n, m) => (m === 0 ? 0 : ((n % m) + m) % m);
+let storageLock = Promise.resolve();
+const cycleByWindow = new Map();
+const modifiersHeldByWindow = new Map();
 
-// Ordered dedupe
-function dedupeOrdered(ids) {
+const mod = (n, m) => (m === 0 ? 0 : ((n % m) + m) % m);
+
+function unique(ids) {
   const seen = new Set();
   const out = [];
-  for (const id of ids) if (!seen.has(id)) { seen.add(id); out.push(id); }
+  for (const id of ids) {
+    if (!seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
   return out;
 }
 
-async function getCurrentWindowActiveTab() {
-  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tabs && tabs[0] ? tabs[0] : null;
+async function locked(fn) {
+  const previous = storageLock;
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  const nextLock = previous.catch(() => {}).then(() => current);
+  storageLock = nextLock;
+
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (storageLock === nextLock) {
+      storageLock = Promise.resolve();
+    }
+  }
 }
 
-async function getTabTitle(id) {
-  try { const t = await chrome.tabs.get(id); return t.title || "(no title)"; }
-  catch { return "[closed]"; }
+async function getAllQueues() {
+  const data = await chrome.storage.local.get([STORAGE_KEY]);
+  const value = data[STORAGE_KEY];
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+async function setAllQueues(queues) {
+  await chrome.storage.local.set({ [STORAGE_KEY]: queues });
+}
+
+async function getQueue(windowId) {
+  const queues = await getAllQueues();
+  const queue = queues[String(windowId)];
+  return Array.isArray(queue) ? queue : [];
+}
+
+async function updateQueue(windowId, updater) {
+  return locked(async () => {
+    const key = String(windowId);
+    const queues = await getAllQueues();
+    const current = Array.isArray(queues[key]) ? queues[key] : [];
+    const next = unique(await updater(current));
+
+    if (next.length > 0) {
+      queues[key] = next;
+    } else {
+      delete queues[key];
+    }
+
+    await setAllQueues(queues);
+    return next;
+  });
+}
+
+async function getActiveTab() {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tabs[0] || null;
+}
+
+function cannotObserveModifiers(tab) {
+  return !tab.url || /^(chrome|edge|brave|vivaldi|opera|about):\/\//.test(tab.url);
+}
+
+async function ensureModifierObserver(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["modifiers.js"],
+    });
+  } catch (e) {
+    // Chrome blocks script injection on chrome:// pages and some internal pages.
+  }
+}
+
+async function cleanQueue(windowId, queue) {
+  const checks = await Promise.allSettled(queue.map((id) => chrome.tabs.get(id)));
+  const valid = [];
+
+  checks.forEach((result, index) => {
+    if (result.status === "fulfilled" && result.value.windowId === windowId) {
+      valid.push(queue[index]);
+    }
+  });
+
+  return unique(valid);
+}
+
+async function buildCycleSnapshot(windowId, activeId) {
+  let queue = await cleanQueue(windowId, await getQueue(windowId));
+
+  queue = unique(queue.filter((id) => id !== activeId));
+  if (activeId != null) {
+    queue.push(activeId);
+  }
+
+  return queue;
+}
+
+async function touchTab(windowId, tabId) {
+  if (tabId == null) return;
+
+  await updateQueue(windowId, async (queue) => {
+    queue = await cleanQueue(windowId, queue);
+    return [...queue.filter((id) => id !== tabId), tabId];
+  });
+}
+
+async function removeTab(windowId, tabId) {
+  await updateQueue(windowId, (queue) => queue.filter((id) => id !== tabId));
+}
+
+async function getTabTitle(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    return tab.title || "(no title)";
+  } catch {
+    return "[closed]";
+  }
 }
 
 function notify(title, message) {
@@ -38,350 +149,250 @@ function notify(title, message) {
   });
 }
 
-/* ======================
- * MRU Queue (persistent)
- * ====================== */
-
-const MRUQueue = {
-  async getAll() {
-    const res = await chrome.storage.local.get([STORAGE_KEYS.QUEUES_BY_WINDOW]);
-    const raw = res[STORAGE_KEYS.QUEUES_BY_WINDOW];
-    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
-  },
-
-  async setAll(queuesByWindow) {
-    await chrome.storage.local.set({ [STORAGE_KEYS.QUEUES_BY_WINDOW]: queuesByWindow });
-  },
-
-  async get(windowId) {
-    const queuesByWindow = await this.getAll();
-    const queueTabs = queuesByWindow[String(windowId)];
-    return Array.isArray(queueTabs) ? queueTabs : [];
-  },
-
-  async set(windowId, queueTabs) {
-    const queuesByWindow = await this.getAll();
-    queuesByWindow[String(windowId)] = queueTabs;
-    await this.setAll(queuesByWindow);
-  },
-
-  async delete(windowId) {
-    const queuesByWindow = await this.getAll();
-    delete queuesByWindow[String(windowId)];
-    await this.setAll(queuesByWindow);
-  },
-
-  /** Move tid to the end (MRU) */
-  async touch(windowId, tid) {
-    if (tid == null) return;
-    const curr = await this.get(windowId);
-    const filtered = curr.filter((id) => id !== tid);
-    const out = dedupeOrdered([...filtered, tid]);
-    await this.set(windowId, out);
-    console.log("[MRU] touch window", windowId, "->", out);
-  },
-
-  /** Remove closed tabs & dedupe */
-  async clean(windowId, queueTabs) {
-    const list = queueTabs ?? (await this.get(windowId));
-    const checks = await Promise.allSettled(list.map((id) => chrome.tabs.get(id)));
-    const valid = [];
-    checks.forEach((r, i) => {
-      if (r.status === "fulfilled") valid.push(list[i]);
-      else console.warn("[MRU] drop closed in window", windowId, ":", list[i]);
-    });
-    return dedupeOrdered(valid);
-  },
-
-  /** Ensure active tab is present once at any position (no reorder) */
-  ensureActivePresent(queueTabs, activeId) {
-    if (activeId != null && !queueTabs.includes(activeId)) {
-      return [...queueTabs, activeId];
-    }
-    return queueTabs;
-  },
-};
-
-/* ======================
- * Cycle Session (ephemeral)
- * ====================== */
-
 class CycleSession {
-  constructor(windowId) {
-    /** @type {WindowId} */ this.windowId = windowId;
-    this.reset();
+  constructor(windowId, snapshot, activeId) {
+    this.windowId = windowId;
+    this.snapshot = snapshot;
+    this.cursor = snapshot.indexOf(activeId);
+    this.fromId = activeId;
+    this.suppressTabId = null;
+    this.lastCommandAt = 0;
   }
 
-  reset() {
-    /** @type {boolean} */ this.active = false;
-    /** @type {TabId|null} */ this.suppressActivationFor = null;
-    /** @type {TabId[]} */ this.snapshot = [];
-    /** @type {number} */ this.cursor = -1;
-    /** @type {TabId|null} */ this.fromId = null;
-    /** @type {Promise<void>|null} */ this.finalizePromise = null;
-  }
-
-  get isActive() { return this.active; }
-
-  /** Start or refresh snapshot; returns boolean indicating (re)started */
-  async startIfNeeded(activeId) {
-    if (!this.active || this.snapshot.length === 0) {
-      let q = await MRUQueue.get(this.windowId);
-      q = await MRUQueue.clean(this.windowId, q);
-      q = MRUQueue.ensureActivePresent(q, activeId);
-      if (q.length === 0) return false;
-
-      this.snapshot = q.slice(); // fixed during cycling
-      this.cursor = this.snapshot.indexOf(activeId);
-      if (this.cursor === -1) {
-        this.snapshot.push(activeId);
-        this.cursor = this.snapshot.length - 1;
-      }
-      this.fromId = activeId;
-      this.active = true;
-      console.log("[Cycle] start window", this.windowId, ":", this.snapshot, "cursor@", this.cursor);
-      return true;
+  pick(step, activeId) {
+    if (this.snapshot.length < 2) {
+      return null;
     }
-    // already active
-    return true;
+
+    this.sync(activeId);
+    this.cursor = mod(this.cursor + step, this.snapshot.length);
+    return this.snapshot[this.cursor];
   }
 
-  resyncCursorTo(tabId) {
-    const idx = this.snapshot.indexOf(tabId);
-    if (idx !== -1) this.cursor = idx;
-  }
-
-  /** Move cursor by step and return target tab id (skips no-op self) */
-  pickNext(step, activeId) {
-    if (this.snapshot.length === 0) return null;
-    this.cursor = safeMod(this.cursor + step, this.snapshot.length);
-    let target = this.snapshot[this.cursor];
-    if (this.snapshot.length > 1 && target === activeId) {
-      this.cursor = safeMod(this.cursor + step, this.snapshot.length);
-      target = this.snapshot[this.cursor];
+  sync(tabId) {
+    const index = this.snapshot.indexOf(tabId);
+    if (index !== -1) {
+      this.cursor = index;
     }
-    return target;
   }
 
-  /** Suppress the onActivated caused by our own switch */
-  suppressOnce(tabId) {
-    this.suppressActivationFor = tabId;
+  suppress(tabId) {
+    this.suppressTabId = tabId;
   }
 
   consumeSuppression(tabId) {
-    if (this.suppressActivationFor === tabId) {
-      console.log("[Cycle] suppressed self-activation for", tabId);
-      this.suppressActivationFor = null;
-      return true;
+    if (this.suppressTabId !== tabId) {
+      return false;
     }
-    return false;
+
+    this.suppressTabId = null;
+    return true;
   }
 
-  async ensureSettled() {
-    if (this.finalizePromise) {
-      await this.finalizePromise;
-    }
-  }
-
-  /** Finalize: reorder MRU so final active is MRU and start tab is 2nd MRU */
-  finalize(reason) {
-    if (!this.isActive) {
-      return Promise.resolve();
-    }
-
-    if (this.finalizePromise) {
-      return this.finalizePromise;
-    }
-
-    const promise = this.finalizeNow(reason).finally(() => {
-      if (this.finalizePromise === promise) {
-        this.finalizePromise = null;
-      }
-    });
-
-    this.finalizePromise = promise;
-    return promise;
-  }
-
-  async finalizeNow(reason) {
+  async commit() {
     const tabs = await chrome.tabs.query({ active: true, windowId: this.windowId });
-    const finalId = tabs && tabs[0] ? tabs[0].id : null;
+    const finalId = tabs[0] ? tabs[0].id : null;
     const fromId = this.fromId;
 
-    let q = await MRUQueue.get(this.windowId);
-    q = await MRUQueue.clean(this.windowId, q);
+    await updateQueue(this.windowId, async (queue) => {
+      queue = await cleanQueue(this.windowId, queue);
 
-    // remove both, then re-append in desired MRU order
-    let out = q.filter((id) => id !== finalId && id !== fromId);
+      const next = queue.filter((id) => id !== finalId && id !== fromId);
+      if (fromId != null && fromId !== finalId) {
+        next.push(fromId);
+      }
+      if (finalId != null) {
+        next.push(finalId);
+      }
 
-    if (finalId != null && fromId != null && finalId !== fromId) {
-      out.push(fromId);  // second-most-recent
-      out.push(finalId); // most-recent
-    } else if (finalId != null) {
-      out.push(finalId);
-    } else if (fromId != null) {
-      out.push(fromId);
+      return next;
+    });
+  }
+}
+
+async function getOrStartCycle(windowId, activeId) {
+  let cycle = cycleByWindow.get(windowId);
+  if (cycle) {
+    if (!cycle.snapshot.includes(activeId)) {
+      cycleByWindow.delete(windowId);
+      await cycle.commit();
+      cycle = null;
     }
-
-    out = dedupeOrdered(out);
-    await MRUQueue.set(this.windowId, out);
-    console.log("[Cycle] finalized window", this.windowId, "reason:", reason || "release", "Queue:", out);
-
-    // reset state
-    this.reset();
   }
-}
 
-const cyclesByWindow = new Map();
-
-function getCycle(windowId) {
-  if (!cyclesByWindow.has(windowId)) {
-    cyclesByWindow.set(windowId, new CycleSession(windowId));
+  if (cycle) {
+    return cycle;
   }
-  return cyclesByWindow.get(windowId);
-}
 
-/* ======================
- * Command Handlers
- * ====================== */
-
-async function handleShowQueue() {
-  const activeTab = await getCurrentWindowActiveTab();
-  if (!activeTab) return;
-
-  const queueTabs = await MRUQueue.get(activeTab.windowId);
-  if (queueTabs.length === 0) {
-    notify("Tab Queue", "Queue is empty.");
-    return;
+  const snapshot = await buildCycleSnapshot(windowId, activeId);
+  if (snapshot.length < 2) {
+    return null;
   }
-  const reversed = [...queueTabs].reverse(); // most recent first
-  const titles = await Promise.all(reversed.map(getTabTitle));
-  const message = titles.map((t, i) => `${i + 1}. ${t}`).join("\n");
-  notify("Tab Queue", message);
+
+  cycle = new CycleSession(windowId, snapshot, activeId);
+  cycleByWindow.set(windowId, cycle);
+  return cycle;
 }
 
 async function handleSwitch(step) {
-  const activeTab = await getCurrentWindowActiveTab();
+  const activeTab = await getActiveTab();
   if (!activeTab) return;
 
-  const activeId = activeTab.id;
-  const windowId = activeTab.windowId;
-  const cycle = getCycle(windowId);
-  await cycle.ensureSettled();
+  const existingCycle = cycleByWindow.get(activeTab.windowId);
+  if (existingCycle && existingCycle.suppressTabId === null) {
+    const commandGap = Date.now() - existingCycle.lastCommandAt;
+    const modifiersHeld = modifiersHeldByWindow.get(activeTab.windowId) === true;
+    if (!modifiersHeld || (cannotObserveModifiers(activeTab) && commandGap > SAME_HOLD_COMMAND_GAP_MS)) {
+      await commitCycle(activeTab.windowId);
+    }
+  }
 
-  const started = await cycle.startIfNeeded(activeId);
-  if (!started) return;
+  modifiersHeldByWindow.set(activeTab.windowId, true);
 
-  // If user manually clicked during the cycle, re-align
-  cycle.resyncCursorTo(activeId);
-
-  const targetId = cycle.pickNext(step, activeId);
-  if (targetId == null || targetId === activeId) return;
-
-  console.log("[Cycle] switching window", windowId, "->", targetId);
-  cycle.suppressOnce(targetId);
-  try {
-    await chrome.tabs.update(targetId, { active: true });
-  } catch (e) {
-    console.warn("[Cycle] failed to switch:", e);
-    // drop suppression to avoid hiding the next real activation
-    cycle.suppressActivationFor = null;
+  const cycle = await getOrStartCycle(activeTab.windowId, activeTab.id);
+  if (!cycle) {
     return;
   }
 
-  // Do not reorder MRU during cycle; finalization happens on modifier release.
+  cycle.lastCommandAt = Date.now();
+
+  const targetId = cycle.pick(step, activeTab.id);
+  if (targetId == null || targetId === activeTab.id) {
+    return;
+  }
+
+  cycle.suppress(targetId);
+
+  try {
+    const tab = await chrome.tabs.update(targetId, { active: true });
+    await ensureModifierObserver(tab.id);
+  } catch (error) {
+    cycle.suppressTabId = null;
+    cycle.snapshot = cycle.snapshot.filter((id) => id !== targetId);
+    console.warn("[TabQueue] failed to activate tab", targetId, error);
+  }
 }
 
-/* ======================
- * Event Wiring
- * ====================== */
+async function handleShowQueue() {
+  const activeTab = await getActiveTab();
+  if (!activeTab) return;
 
-chrome.commands.onCommand.addListener(async (command) => {
-  console.log("[Cmd]", command);
-  if (command === "showQueue") return handleShowQueue();
-  if (command === "switchBack")  return handleSwitch(-1);
-  if (command === "switchForward") return handleSwitch(1);
-});
+  await commitCycle(activeTab.windowId);
 
-chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
-  const cycle = getCycle(windowId);
-  if (cycle.consumeSuppression(tabId)) return;
+  const queue = await buildCycleSnapshot(activeTab.windowId, activeTab.id);
+  if (queue.length === 0) {
+    notify("Tab Queue", "Queue is empty.");
+    return;
+  }
 
-  console.log("[Tabs] user activation window", windowId, ":", tabId);
-  if (!cycle.isActive) {
-    // Outside cycling -> normal MRU
-    await MRUQueue.touch(windowId, tabId);
-  } else {
-    // During cycling: keep queue frozen and only track manual picks.
-    cycle.resyncCursorTo(tabId);
+  const titles = await Promise.all([...queue].reverse().map(getTabTitle));
+  notify("Tab Queue", titles.map((title, index) => `${index + 1}. ${title}`).join("\n"));
+}
+
+async function handleClearQueue() {
+  const activeTab = await getActiveTab();
+  if (!activeTab) return;
+
+  cycleByWindow.delete(activeTab.windowId);
+  await updateQueue(activeTab.windowId, () => []);
+  notify("Tab Queue", "Queue cleared.");
+}
+
+async function commitCycle(windowId) {
+  const cycle = cycleByWindow.get(windowId);
+  if (!cycle) return;
+
+  cycleByWindow.delete(windowId);
+  await cycle.commit();
+}
+
+chrome.commands.onCommand.addListener((command) => {
+  if (command === "switchBack") {
+    handleSwitch(-1).catch(console.error);
+  } else if (command === "switchForward") {
+    handleSwitch(1).catch(console.error);
+  } else if (command === "showQueue") {
+    handleShowQueue().catch(console.error);
+  } else if (command === "clearQueue") {
+    handleClearQueue().catch(console.error);
   }
 });
 
-chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  ensureModifierObserver(tabId).catch(console.error);
+
+  const cycle = cycleByWindow.get(windowId);
+
+  if (cycle && cycle.consumeSuppression(tabId)) {
+    return;
+  }
+
+  if (cycle) {
+    cycle.sync(tabId);
+    commitCycle(windowId).catch(console.error);
+    return;
+  }
+
+  touchTab(windowId, tabId).catch(console.error);
+});
+
+chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
   const windowId = removeInfo.windowId;
-  const cycle = getCycle(windowId);
-  const q = await MRUQueue.get(windowId);
-  const filtered = q.filter((id) => id !== tabId);
-  if (filtered.length !== q.length) {
-    const cleaned = dedupeOrdered(filtered);
-    await MRUQueue.set(windowId, cleaned);
-    console.log("[Tabs] removed from window", windowId, ":", tabId, "queue ->", cleaned);
-  }
+  const cycle = cycleByWindow.get(windowId);
 
-  // Keep snapshot clean, too
-  if (cycle.isActive && cycle.snapshot.length) {
-    const idx = cycle.snapshot.indexOf(tabId);
-    if (idx !== -1) {
-      cycle.snapshot.splice(idx, 1);
-      if (cycle.cursor >= cycle.snapshot.length) {
-        cycle.cursor = cycle.snapshot.length - 1;
-      }
+  if (cycle) {
+    cycle.snapshot = cycle.snapshot.filter((id) => id !== tabId);
+    if (cycle.cursor >= cycle.snapshot.length) {
+      cycle.cursor = cycle.snapshot.length - 1;
     }
   }
+
+  removeTab(windowId, tabId).catch(console.error);
 });
 
 chrome.runtime.onMessage.addListener((message, sender) => {
-  if (!message || !sender.tab || typeof sender.tab.windowId === "undefined") {
-    return;
-  }
-
-  const cycle = getCycle(sender.tab.windowId);
-  if (!cycle.isActive) {
+  if (!message || !sender.tab) {
     return;
   }
 
   if (message.type === "modifiersObserved") {
-    cycle.finalize("new modifier hold").catch(console.error);
+    modifiersHeldByWindow.set(sender.tab.windowId, true);
     return;
   }
 
   if (message.type === "modifiersReleased") {
-    cycle.finalize("modifier release").catch(console.error);
+    modifiersHeldByWindow.set(sender.tab.windowId, false);
+    commitCycle(sender.tab.windowId).catch(console.error);
   }
 });
 
-/* ======================
- * Startup / Install
- * ====================== */
+chrome.windows.onRemoved.addListener((windowId) => {
+  cycleByWindow.delete(windowId);
+  modifiersHeldByWindow.delete(windowId);
+  updateQueue(windowId, () => []).catch(console.error);
+});
 
-async function validateQueue() {
-  const queuesByWindow = await MRUQueue.getAll();
-  const cleanedByWindow = {};
+async function validateQueues() {
+  await locked(async () => {
+    const queues = await getAllQueues();
+    const cleaned = {};
 
-  for (const [windowId, queueTabs] of Object.entries(queuesByWindow)) {
-    const cleaned = await MRUQueue.clean(Number(windowId), Array.isArray(queueTabs) ? queueTabs : []);
-    if (cleaned.length) {
-      cleanedByWindow[windowId] = dedupeOrdered(cleaned);
+    for (const [windowId, queue] of Object.entries(queues)) {
+      const valid = await cleanQueue(Number(windowId), Array.isArray(queue) ? queue : []);
+      if (valid.length > 0) {
+        cleaned[windowId] = valid;
+      }
     }
-  }
 
-  await MRUQueue.setAll(cleanedByWindow);
-  console.log("[Init] queues validated");
+    await setAllQueues(cleaned);
+  });
 }
 
-chrome.runtime.onStartup.addListener(validateQueue);
-chrome.runtime.onInstalled.addListener(validateQueue);
-chrome.windows.onRemoved.addListener(async (windowId) => {
-  cyclesByWindow.delete(windowId);
-  await MRUQueue.delete(windowId);
-});
+async function initializeQueues() {
+  await validateQueues();
+  const activeTabs = await chrome.tabs.query({ active: true });
+  await Promise.all(activeTabs.map((tab) => touchTab(tab.windowId, tab.id)));
+}
+
+chrome.runtime.onStartup.addListener(() => initializeQueues().catch(console.error));
+chrome.runtime.onInstalled.addListener(() => initializeQueues().catch(console.error));
